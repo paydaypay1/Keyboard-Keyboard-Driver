@@ -53,7 +53,8 @@ class MidiKeyboardDriver
   def initialize(on_status:, on_event:)
     @on_status = on_status
     @on_event = on_event
-    @config = load_config
+    @config_path = CONFIG_PATH
+    @config = load_config(@config_path)
     @running = false
     @held = {} # [channel,note] => key
     @held_mutex = Mutex.new
@@ -63,22 +64,34 @@ class MidiKeyboardDriver
     @learn_mutex = Mutex.new
   end
 
-  def load_config
-    return JSON.parse(File.read(CONFIG_PATH)) if File.file?(CONFIG_PATH)
-    return DEFAULT_CONFIG.transform_values { |v| v.is_a?(Hash) ? Marshal.load(Marshal.dump(v)) : v }
-  rescue JSON::ParserError => e
-    warn "Invalid mappings.json: #{e.message}; using defaults"
-    Marshal.load(Marshal.dump(DEFAULT_CONFIG))
+  def load_config(path = @config_path)
+    return Marshal.load(Marshal.dump(DEFAULT_CONFIG)) unless File.file?(path)
+
+    data = JSON.parse(File.read(path))
+    raise "Mapping file must contain a JSON object" unless data.is_a?(Hash)
+    raise "Missing mappings object" unless data["mappings"].is_a?(Hash)
+
+    data["input_port"] ||= ""
+    data["min_velocity"] ||= 1
+    data["velocity_mode"] ||= "threshold"
+    data
   end
 
-  def load_default_config
-    return DEFAULT_CONFIG.transform_values { |v| v.is_a?(Hash) ? Marshal.load(Marshal.dump(v)) : v }
+  def load_config_file(path)
+    new_config = load_config(path)
+    @config = new_config
+    @config_path = File.expand_path(path)
   end
 
-  def save_config
-    tmp = "#{CONFIG_PATH}.tmp"
-    File.write(tmp, JSON.pretty_generate(@config))
-    File.rename(tmp, CONFIG_PATH)
+  def save_config(path = @config_path)
+    path = File.expand_path(path)
+    File.write("#{path}.tmp", JSON.pretty_generate(@config))
+    File.rename("#{path}.tmp", path)
+    @config_path = path
+  end
+
+  def config_path
+    @config_path
   end
 
   def midi_ports
@@ -244,7 +257,7 @@ end
 
 class MidiDriverGUI
   def initialize
-    @root = TkRoot.new { title "Ruby MIDI Keyboard Driver"; minsize(760, 600) }
+    @root = TkRoot.new { title "MIDI Notes to Characters Driver"; minsize(760, 600) }
     @driver = MidiKeyboardDriver.new(
       on_status: ->(msg) { ui { @status_var.value = msg } },
       on_event: ->(msg) { ui { add_log(msg) } }
@@ -277,7 +290,6 @@ class MidiDriverGUI
     @start_button = TkButton.new(top, text: "Start", command: proc { start_input })
     @start_button.pack(side: "left", padx: 3)
     TkButton.new(top, text: "Stop", command: proc { @driver.stop }).pack(side: "left", padx: 3)
-    TkButton.new(top, text: "Load Default Mapping", command: proc { @driver.load_default_config }).pack(side: "left", padx: 9)
 
     TkLabel.new(@root, textvariable: (@status_var = TkVariable.new("Ready")), anchor: "w",
       relief: "sunken", padx: 6, pady: 4).pack(fill: "x", padx: 10, pady: 4)
@@ -285,7 +297,7 @@ class MidiDriverGUI
     mid = TkFrame.new(@root) { padx 10; pady 6 }.pack(fill: "both", expand: true)
     left = TkFrame.new(mid).pack(side: "left", fill: "both", expand: true)
     TkLabel.new(left, text: "Mappings (channel:note → key)", anchor: "w").pack(fill: "x")
-    @mapping_list = TkListbox.new(left, height: 16, selectmode: "browse", exportselection: false)
+    @mapping_list = TkListbox.new(left, height: 16, selectmode: "extended", exportselection: false)
     @mapping_list.pack(fill: "both", expand: true, pady: 4)
     @mapping_list.bind("<ButtonRelease-1>", proc { select_mapping })
 
@@ -306,8 +318,26 @@ class MidiDriverGUI
     TkButton.new(right, text: "Learn note…", command: proc { learn_note }).pack(fill: "x", pady: [12, 3])
     TkButton.new(right, text: "Save / update mapping", command: proc { save_mapping }).pack(fill: "x", pady: 3)
     TkButton.new(right, text: "Delete mapping", command: proc { delete_mapping }).pack(fill: "x", pady: 3)
-    TkButton.new(right, text: "Save JSON", command: proc { save_json }).pack(fill: "x", pady: 3)
     TkLabel.new(right, text: "Velocity mode: threshold").pack(anchor: "w", pady: [10, 0])
+
+    # TkButton.new(right, text: "Save JSON", command: proc { save_json }).pack(fill: "x", pady: 3)
+    TkButton.new(
+      right,
+      text: "Load File...",
+      command: proc { load_json_file }
+    ).pack(fill: "x", pady: 3)
+
+    TkButton.new(
+      right,
+      text: "Save As...",
+      command: proc { save_json_as }
+    ).pack(fill: "x", pady: 3)
+
+    TkButton.new(
+      right,
+      text: "Save",
+      command: proc { save_json }
+    ).pack(fill: "x", pady: 3)
 
     bottom = TkFrame.new(@root) { padx 10; pady 6 }.pack(fill: "both", expand: true)
     TkLabel.new(bottom, text: "Event log", anchor: "w").pack(fill: "x")
@@ -343,18 +373,29 @@ class MidiDriverGUI
     end
   end
 
+
   def select_mapping
-    idx = @mapping_list.curselection.first
-    return unless idx
-    entry = @driver.config.fetch("mappings", {}).sort_by { |id, _| id.split(":").map(&:to_i) }[idx]
+    indices = @mapping_list.curselection.map(&:to_i)
+    return if indices.empty?
+
+    entries = @driver.config.fetch("mappings", {}).sort_by do |id, _|
+      id.split(":").map(&:to_i)
+    end
+
+    entry = entries[indices.first]
     return unless entry
+
     @selected_mapping = entry[0]
     channel, note = @selected_mapping.split(":").map(&:to_i)
     mapping = entry[1]
+
     @channel_var.value = channel.to_s
     @note_var.value = note.to_s
     @key_var.value = mapping["key"].to_s
     @velocity_var.value = (mapping["min_velocity"] || 1).to_s
+
+    @status_var.value =
+        "#{indices.length} selected; editing first mapping"
   end
 
   def learn_note
@@ -386,18 +427,67 @@ class MidiDriverGUI
     @status_var.value = "Mapping error: #{e.message}"
   end
 
+
   def delete_mapping
-    channel = Integer(@channel_var.value) rescue 0
-    note = Integer(@note_var.value) rescue 60
-    id = "#{channel}:#{note}"
-    @driver.config["mappings"].delete(id)
+    indices = @mapping_list.curselection.map(&:to_i)
+
+    entries = @driver.config.fetch("mappings", {}).sort_by do |id, _|
+      id.split(":").map(&:to_i)
+    end
+
+    if indices.empty?
+      channel = Integer(@channel_var.value)
+      note = Integer(@note_var.value)
+      ids = ["#{channel}:#{note}"]
+    else
+      ids = indices.filter_map { |index| entries[index]&.first }
+    end
+
+    ids.each { |id| @driver.config["mappings"].delete(id) }
+
+    @selected_mapping = nil
     load_mapping_table
-    @status_var.value = "Deleted mapping #{id}"
+    @status_var.value = "Deleted #{ids.length} mapping(s)"
+  rescue => e
+    @status_var.value = "Delete error: #{e.message}"
+  end
+
+  def load_json_file
+    path = Tk.getOpenFile(
+      "title" => "Load MIDI mappings",
+      "initialdir" => File.dirname(@driver.config_path),
+      "filetypes" => [["JSON files", ".json"], ["All files", "*"]]
+    )
+    return if path.nil? || path.empty?
+
+    @driver.load_config_file(path)
+    @selected_mapping = nil
+    load_mapping_table
+    @status_var.value = "Loaded #{path}"
+  rescue => e
+    @status_var.value = "Load error: #{e.message}"
+  end
+
+  def save_json_as
+    path = Tk.getSaveFile(
+      "title" => "Save MIDI mappings as",
+      "initialdir" => File.dirname(@driver.config_path),
+      "initialfile" => File.basename(@driver.config_path),
+      "defaultextension" => ".json",
+      "filetypes" => [["JSON files", ".json"], ["All files", "*"]]
+    )
+    return if path.nil? || path.empty?
+
+    path += ".json" if File.extname(path).empty?
+    @driver.save_config(path)
+    @status_var.value = "Saved #{path}"
+  rescue => e
+    @status_var.value = "Save error: #{e.message}"
   end
 
   def save_json
     @driver.save_config
-    @status_var.value = "Saved #{CONFIG_PATH}"
+    @status_var.value = "Saved #{@driver.config_path}"
   rescue => e
     @status_var.value = "Save error: #{e.message}"
   end
